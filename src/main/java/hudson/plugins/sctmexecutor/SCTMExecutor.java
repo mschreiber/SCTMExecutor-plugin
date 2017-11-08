@@ -12,12 +12,15 @@ import java.util.logging.Logger;
 
 import org.kohsuke.stapler.DataBoundConstructor;
 
+import hudson.AbortException;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
 import hudson.model.Cause;
+import hudson.model.Run;
+import hudson.model.TaskListener;
 import hudson.model.Cause.UpstreamCause;
 import hudson.plugins.sctmexecutor.exceptions.SCTMException;
 import hudson.plugins.sctmexecutor.service.ISCTMService;
@@ -26,6 +29,7 @@ import hudson.plugins.sctmexecutor.service.SCTMService;
 import hudson.tasks.Builder;
 import hudson.util.Secret;
 import jenkins.model.Jenkins;
+import jenkins.tasks.SimpleBuildStep;
 
 /**
  * Executes a specified execution plan on Micro Focus Silk Central.
@@ -33,7 +37,7 @@ import jenkins.model.Jenkins;
  * @author Thomas Fuerer
  * 
  */
-public final class SCTMExecutor extends Builder {
+public final class SCTMExecutor extends Builder implements SimpleBuildStep {
   static final int OPT_NO_BUILD_NUMBER = 1;
   static final int OPT_USE_THIS_BUILD_NUMBER = 2;
   static final int OPT_USE_SPECIFICJOB_BUILDNUMBER = 3;
@@ -144,7 +148,7 @@ public final class SCTMExecutor extends Builder {
     try {
       ISCTMService service = createSctmService(projectId, execDefIdList);
       listener.getLogger().println(Messages.getString("SCTMExecutor.log.successfulLogin")); //$NON-NLS-1$
-      FilePath rootDir = createResultDir(build.number, build, listener);
+      FilePath rootDir = createResultDir(build.number, build.getWorkspace(), listener);
 
       Collection<Thread> executions = new ArrayList<Thread>(execDefIdList.size());
       int buildNumber = getOrAddBuildNumber(build, listener, execDefIdList.get(0), service);
@@ -238,9 +242,8 @@ public final class SCTMExecutor extends Builder {
     return -1;
   }
 
-  private FilePath createResultDir(int currentBuildNo, AbstractBuild<?, ?> build, BuildListener listener)
+  private FilePath createResultDir(int currentBuildNo, FilePath rootDir, TaskListener listener)
       throws IOException, InterruptedException {
-    FilePath rootDir = build.getWorkspace();
     if (rootDir == null) {
       LOGGER.severe("Cannot write the result file because slave is not connected."); //$NON-NLS-1$
       listener.error(Messages.getString("SCTMExecutor.log.slaveNotConnected")); //$NON-NLS-1$
@@ -267,5 +270,47 @@ public final class SCTMExecutor extends Builder {
     }
     return buildResults;
   }
+
+@Override
+public void perform(Run<?, ?> run, FilePath filePath, Launcher launcher, TaskListener listener)
+		throws InterruptedException, IOException {
+	
+    SCTMExecutorDescriptor descriptor = getDescriptor();
+    String serviceURL = descriptor.getServiceURL();
+    List<Integer> execDefIdList = Utils.csvToIntList(execDefIds);
+    try {
+      ISCTMService service = createSctmService(projectId, execDefIdList);
+      listener.getLogger().println(Messages.getString("SCTMExecutor.log.successfulLogin")); //$NON-NLS-1$
+      FilePath rootDir = createResultDir(run.number, filePath, listener);
+
+      Collection<Thread> executions = new ArrayList<Thread>(execDefIdList.size());
+      int buildNumber =  service.getLatestSCTMBuildnumber(execDefIdList.get(0));
+      for (Integer execDefId : execDefIdList) {
+        ITestResultWriter resultWriter = null;
+        if (collectResults) {
+          resultWriter = new SCTMResultWriter(rootDir, service, ignoreSetupCleanup);
+        }
+        Runnable resultCollector = new ExecutionRunnable(service, execDefId, buildNumber, resultWriter, listener
+            .getLogger());
+
+        Thread t = new Thread(resultCollector);
+        executions.add(t);
+        t.start();
+        if (delay > 0 && execDefIdList.size() > 1) {
+          Thread.sleep(delay * 1000);
+        }
+      }
+
+      for (Thread t : executions) {
+        t.join();
+      }
+    } catch (SCTMException e) {
+      LOGGER.log(Level.SEVERE, MessageFormat.format(
+          "Creating a remote connection to SCTM host ({0}) failed.", serviceURL), e); //$NON-NLS-1$
+      listener.fatalError(e.getMessage());
+      throw new AbortException(e.getMessage());
+    }
+	
+}
 }
 
